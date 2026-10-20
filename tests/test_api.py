@@ -58,6 +58,14 @@ def test_phase_one_database_gets_additive_discovery_columns(tmp_path):
         )
         connection.execute(
             text(
+                "CREATE TABLE generated_shorts ("
+                "id INTEGER PRIMARY KEY, source_video_id INTEGER NOT NULL, output_path VARCHAR(2048), "
+                "title VARCHAR(100), description TEXT, duration_seconds INTEGER, status VARCHAR(32) NOT NULL, "
+                "created_at DATETIME NOT NULL, updated_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
                 "INSERT INTO source_videos "
                 "(platform_video_id, title, source_url, status, created_at, updated_at) "
                 "VALUES ('existing001', 'Existing source', 'https://example.test/video', "
@@ -68,9 +76,11 @@ def test_phase_one_database_gets_additive_discovery_columns(tmp_path):
     ensure_schema(engine)
 
     columns = {column["name"] for column in inspect(engine).get_columns("source_videos")}
+    short_columns = {column["name"] for column in inspect(engine).get_columns("generated_shorts")}
     with engine.connect() as connection:
         existing_title = connection.execute(
             text("SELECT title FROM source_videos WHERE platform_video_id = 'existing001'")
         ).scalar_one()
     assert {"category", "view_count", "ranking_score", "metric_history"}.issubset(columns)
+    assert {"config_hash", "script", "captions_text", "attempt_count", "error_message"}.issubset(short_columns)
     assert existing_title == "Existing source"

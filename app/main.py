@@ -11,6 +11,9 @@ from app.database import create_database_engine, create_session_factory, ensure_
 from app.discovery.provider import DiscoveryProvider, YouTubeDataApiProvider
 from app.discovery.routes import router as discovery_router
 from app.errors import register_error_handlers
+from app.generation.media import FFmpegMediaProcessor
+from app.generation.routes import router as generation_router
+from app.generation.service import GenerationService
 from app.logging_config import configure_logging
 from app import models  # noqa: F401 - register model metadata before table creation
 
@@ -21,6 +24,7 @@ def create_app(
     settings: Settings | None = None,
     engine: Engine | None = None,
     discovery_provider: DiscoveryProvider | None = None,
+    media_processor: FFmpegMediaProcessor | None = None,
 ) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
@@ -36,7 +40,7 @@ def create_app(
     app = FastAPI(
         title=app_settings.app_name,
         version="0.1.0",
-        description="Phase 1 and 2 local foundation for YouTube Shorts discovery and ranking.",
+        description="Local YouTube Shorts discovery, ranking, and authorized video generation backend.",
         lifespan=lifespan,
     )
     app.state.engine = app_engine
@@ -51,8 +55,11 @@ def create_app(
         api_key,
         timeout_seconds=app_settings.youtube_request_timeout_seconds,
     )
+    app.state.media_processor = media_processor or FFmpegMediaProcessor(app_settings)
+    app.state.generation_service = GenerationService(app_settings, app.state.media_processor)
     register_error_handlers(app)
     app.include_router(discovery_router)
+    app.include_router(generation_router)
 
     @app.get("/health", tags=["health"], summary="Check service and database health")
     def health() -> dict[str, str]:

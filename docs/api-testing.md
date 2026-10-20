@@ -300,6 +300,208 @@ Example response (`200`):
 }
 ```
 
+## Phase 3: Authorized video generation
+
+FFmpeg and ffprobe must be on `PATH` to render. The Codespaces devcontainer installs them automatically when the Codespace is created. If missing on Ubuntu/Debian or in an existing Codespace, run:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg
+ffmpeg -version
+ffprobe -version
+```
+
+eSpeak NG is optional. Install it only if local narration is required:
+
+```bash
+sudo apt-get install -y espeak-ng
+espeak-ng --version
+```
+
+Generation uses only media you own or are authorized to reuse. The rights checkbox/form field is your attestation; the application cannot determine whether a license is legally valid. Discovered YouTube candidates start as `REQUIRES_PERMISSION`. Their metadata is never treated as permission to use the footage. Attach an authorized file or direct media URL to the candidate before retrying generation. YouTube watch/shorts, Googlevideo, private-network URLs, URL redirects, DRM bypasses, and access-control bypasses are not supported.
+
+Captions, cropping, commentary, or narration do not make unlicensed footage copyright-safe. No music is added by this phase. Generated scripts are local deterministic drafts or user-supplied text; they must be reviewed. The only built-in narration is generic local eSpeak NG speech, never a cloned or impersonated real person's voice. Children's-category scripts/captions are rejected if they contain basic email/phone patterns; this is a safeguard, not a full content moderation system.
+
+### Check tools and current settings
+
+`GET /api/v1/shorts/settings` displays safe generation configuration and whether tools are available. It does not reveal absolute media paths or credentials.
+
+```bash
+curl http://localhost:8000/api/v1/shorts/settings
+```
+
+Example response:
+
+```json
+{
+  "default_duration_seconds": 45,
+  "maximum_duration_seconds": 180,
+  "aspect_ratio": "9:16",
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "video_crf": 23,
+  "video_preset": "medium",
+  "audio_bitrate": "192k",
+  "caption_font_name": "DejaVu Sans",
+  "caption_font_size": 48,
+  "caption_margin_vertical": 120,
+  "caption_outline_size": 3,
+  "caption_primary_color": "&H00FFFFFF",
+  "caption_outline_color": "&H00000000",
+  "narration_provider": "none",
+  "narration_available": false,
+  "ffmpeg_available": true,
+  "ffprobe_available": true,
+  "max_source_file_mb": 500,
+  "max_output_file_mb": 1000,
+  "output_directory": "outputs",
+  "category_templates": {}
+}
+```
+
+### Register a user-provided authorized file
+
+`POST /api/v1/shorts/sources/upload` accepts multipart fields `file`, `creator`, `license_or_permission`, and `rights_verified`; `candidate_video_id` and `category` are optional. Supported suffixes: MP4, MOV, M4V, MKV, and WebM. The upload size is bounded by `MAX_SOURCE_FILE_MB` and probed by ffprobe before it is stored.
+
+In Swagger, choose **Try it out**, select a small authorized MP4 file, enter creator and permission details, and set `rights_verified` to `true` only after verifying the rights yourself.
+
+Example response (`201`):
+
+```json
+{
+  "source_id": 17,
+  "candidate_video_id": "local_27f4ab322b834b0abf4c110f784a210e",
+  "title": "owned",
+  "source_type": "user_file",
+  "rights_verification_status": "VERIFIED",
+  "rights_verified": true,
+  "creator": "My production team",
+  "media_attached": true
+}
+```
+
+Do not supply a path or filename as a server path. The server generates a random storage name.
+
+### Register an authorized direct media URL
+
+`POST /api/v1/shorts/sources/url` downloads one directly accessible, public HTTPS video file only after the same permission attestation. YouTube URLs and private/local addresses are rejected; redirects are not followed. URLs need a supported media extension and `video/*` or `application/octet-stream` response.
+
+Request:
+
+```json
+{
+  "source_url": "https://media.example.org/owned-clip.mp4",
+  "creator": "My production team",
+  "license_or_permission": "Owned by our production team",
+  "rights_verified": true,
+  "category": "education"
+}
+```
+
+The response has the same shape as file registration with `source_type: "authorized_url"`. Source URL contents are stored as attribution metadata; full URL credentials are rejected and URLs are not returned by source APIs.
+
+### Submit generation
+
+`POST /api/v1/shorts/generate` accepts exactly one of `source_id` (registered media) or `candidate_video_id` (Phase 2 candidate). Optional fields include a title, category, original commentary or script, captions, duration, and `include_narration`. An identical source/configuration returns the same job rather than creating a duplicate. Generation runs synchronously in the request; this phase does not add a background queue.
+
+Request after source registration:
+
+```json
+{
+  "source_id": 17,
+  "title": "How this optical illusion works",
+  "category": "education",
+  "commentary": "Here is an original explanation of the visual effect.",
+  "duration_seconds": 30,
+  "include_narration": false
+}
+```
+
+The response includes `job_id`, status, reviewable title/description/script/captions, render dimensions, output filename/preview URL on success, attempt count, and useful errors on failure. Typical terminal statuses are `COMPLETED`, `FAILED`, or `REQUIRES_PERMISSION`.
+
+Example completed response (`201`):
+
+```json
+{
+  "job_id": 42,
+  "source_id": 17,
+  "candidate_video_id": "local_27f4ab322b834b0abf4c110f784a210e",
+  "status": "COMPLETED",
+  "attempt_count": 1,
+  "error": null,
+  "draft_title": "How this optical illusion works",
+  "draft_description": "Original commentary: Here is an original explanation of the visual effect.\n\n#Shorts #education",
+  "script": "Original commentary: Here is an original explanation of the visual effect.",
+  "captions": "1\n00:00:00,000 --> 00:00:30,000\nOriginal commentary: Here is an original explanation of the visual effect.\n",
+  "narration": null,
+  "duration_seconds": 30,
+  "width": 1080,
+  "height": 1920,
+  "fps": 30,
+  "file_size_bytes": 18324567,
+  "output_filename": "short_42.mp4",
+  "preview_url": "/api/v1/shorts/jobs/42/preview",
+  "created_at": "2026-10-20T12:00:00Z",
+  "started_at": "2026-10-20T12:00:01Z",
+  "completed_at": "2026-10-20T12:00:22Z"
+}
+```
+
+For an unauthorized discovered candidate, the job is persisted with `REQUIRES_PERMISSION`; FFmpeg is not called. Register/attach an authorized file with `candidate_video_id`, then retry that job.
+
+### Get job status and errors
+
+`GET /api/v1/shorts/jobs/{job_id}` returns the job response above, including draft text and the latest error.
+
+```bash
+curl http://localhost:8000/api/v1/shorts/jobs/42
+```
+
+Job states are `PENDING`, `VALIDATING_SOURCE`, `GENERATING_SCRIPT`, `RENDERING`, `COMPLETED`, `REQUIRES_PERMISSION`, and `FAILED`. Intermediate stages are persisted before processing; failures include a sanitized message and incremented attempt count.
+
+### List jobs
+
+`GET /api/v1/shorts/jobs` supports `page`, `page_size` (maximum 100), `status`, and `source_id`.
+
+```bash
+curl 'http://localhost:8000/api/v1/shorts/jobs?page=1&page_size=20&status=COMPLETED'
+```
+
+Response: `{ "total": 1, "page": 1, "page_size": 20, "items": [ ...job response... ] }`.
+
+### Retry a failed or newly authorized job
+
+`POST /api/v1/shorts/jobs/{job_id}/retry` retries a failed job, or one blocked by missing permission after its source has been authorized and media attached. Retries are capped by `MAX_GENERATION_ATTEMPTS` (default 3); completed jobs and other active states cannot be retried.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/shorts/jobs/42/retry
+```
+
+The endpoint returns the updated job response. A failed render stays recorded as `FAILED` with its error rather than disappearing.
+
+### Preview or download output
+
+`GET /api/v1/shorts/jobs/{job_id}/preview` streams the completed MP4 as `video/mp4` with a server-generated filename. It returns `409` unless the job completed and `404` if its output is missing/outside the configured directory. The endpoint never accepts a filesystem path.
+
+```bash
+curl -L http://localhost:8000/api/v1/shorts/jobs/42/preview -o short_42.mp4
+```
+
+Default storage locations are `data/media/` (sources), `data/outputs/` (MP4 and SRT), and `data/shorts.db` (SQLite). These are ignored by Git. Codespace storage persists while the Codespace is stopped but is not a backup and may be deleted with the Codespace. Download finished work through the preview endpoint and save it outside the Codespace for durable retention; do not commit media files.
+
+### Local narration
+
+Narration is disabled by default. Install eSpeak NG and configure `NARRATION_PROVIDER=espeak` to enable the optional local synthetic voice; set `include_narration: true` per request. Ubuntu/Codespaces:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y espeak-ng
+espeak-ng --version
+```
+
+If narration is requested while the provider is `none` or unavailable, the job fails clearly and preserves its script/captions for review. No paid AI provider or voice cloning is included.
+
 ## Ranking calculation and limitations
 
 The default factor weights are recency 0.20, views/day 0.45, engagement 0.25, and view velocity 0.10. Each available factor is normalized to 0–100, then:

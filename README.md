@@ -1,14 +1,14 @@
 # YouTube Shorts Automation Backend
 
-Phase 1 and 2 foundation for a locally runnable YouTube Shorts automation backend. It provides FastAPI, SQLite persistence, YouTube Data API v3 discovery, transparent trend scoring, and candidate shortlist endpoints. Discovery stores metadata only: it does not download or copy footage, generate videos, or upload content.
+Phase 1–3 foundation for a locally runnable YouTube Shorts automation backend. It provides FastAPI, SQLite persistence, YouTube Data API v3 discovery/ranking, and a local authorized-source-to-Short rendering pipeline. Phase 3 creates draft scripts, captions, metadata, and local vertical MP4 files; it does not upload or schedule content.
 
 ## Requirements
 
 - Python 3.12 or newer
-- FFmpeg is not required for Phases 1 or 2; it may be needed by a future video-processing phase.
+- FFmpeg and ffprobe are required to render/validate videos. Phase 1/2 APIs and tests can run without them. eSpeak NG is optional and only needed for local narration.
 - A YouTube Data API v3 key is optional for startup, health checks, browsing stored candidates, and tests. It is required for live discovery.
 - No OAuth credentials, paid AI services, or external database are required.
-- Runtime packages are listed in `requirements.txt`: FastAPI, Uvicorn, SQLAlchemy, Pydantic Settings, HTTPX, and pytest.
+- Runtime packages are listed in `requirements.txt`: FastAPI, Uvicorn, SQLAlchemy, Pydantic Settings, HTTPX, python-multipart, and pytest.
 
 ## Setup
 
@@ -21,6 +21,22 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 cp -n .env.example .env
+```
+
+Install FFmpeg locally if it is missing (Ubuntu/Debian/Codespaces):
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ffmpeg
+ffmpeg -version
+ffprobe -version
+```
+
+The Codespaces devcontainer installs FFmpeg and eSpeak NG during creation. eSpeak NG is optional; install it locally only if you want narration:
+
+```bash
+sudo apt-get install -y espeak-ng
+espeak-ng --version
 ```
 
 On Windows PowerShell, use these activation/install commands instead:
@@ -57,7 +73,7 @@ Start the development server on port 8000:
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The application also initializes/migrates tables on startup. The additive migration extends the existing `source_videos` table without removing Phase 1 rows. In Codespaces, open forwarded port 8000. Visit `/health` for service/database status and `/docs` for interactive Swagger documentation. Phase 2 endpoints are under `/api/v1`.
+The application also initializes/migrates tables on startup. Additive migrations extend the existing `source_videos` and `generated_shorts` tables without removing earlier rows. In Codespaces, open forwarded port 8000. Visit `/health` for service/database status and `/docs` for interactive Swagger documentation. Phase 2/3 endpoints are under `/api/v1`.
 
 ## Tests
 
@@ -89,6 +105,26 @@ Settings are loaded from environment variables and the optional root `.env` file
 | `RANKING_VIEWS_PER_DAY_REFERENCE` | `100000` | Reference used to normalize views/day. |
 | `RANKING_ENGAGEMENT_REFERENCE` | `0.05` | Like/view ratio normalized to an engagement score of 100. |
 | `RANKING_MIN_VELOCITY_INTERVAL_HOURS` | `1` | Minimum interval between observed view samples before velocity is included. |
+| `SOURCE_MEDIA_DIRECTORY` | `./data/media` | Local source-media directory. |
+| `GENERATION_OUTPUT_DIRECTORY` | `./data/outputs` | Local rendered MP4 and caption directory. |
+| `MAX_SOURCE_FILE_MB` | `500` | Maximum uploaded/downloaded source size. |
+| `MAX_OUTPUT_FILE_MB` | `1000` | Maximum rendered output size. |
+| `MEDIA_DOWNLOAD_TIMEOUT_SECONDS` | `20` | Timeout for authorized direct-media URL downloads. |
+| `DEFAULT_SHORT_DURATION_SECONDS` | `45` | Default target duration. |
+| `MAX_SHORT_DURATION_SECONDS` | `180` | Maximum allowed requested/rendered duration. |
+| `VIDEO_ASPECT_RATIO` | `9:16` | Target video aspect ratio. Dimensions must match. |
+| `VIDEO_WIDTH` / `VIDEO_HEIGHT` | `1080` / `1920` | Output frame dimensions. |
+| `VIDEO_FPS` | `30` | Output frame rate. |
+| `VIDEO_CRF` / `VIDEO_PRESET` | `23` / `medium` | H.264 quality and encoder speed/size tradeoff. |
+| `AUDIO_BITRATE` | `192k` | AAC audio bitrate. |
+| `CAPTION_FONT_NAME` / `CAPTION_FONT_SIZE` | `DejaVu Sans` / `48` | Burned-in subtitle style. |
+| `CAPTION_MARGIN_VERTICAL` / `CAPTION_OUTLINE_SIZE` | `120` / `3` | Subtitle safe margin and outline. |
+| `CAPTION_PRIMARY_COLOR` / `CAPTION_OUTLINE_COLOR` | `&H00FFFFFF` / `&H00000000` | ASS subtitle colors. |
+| `NARRATION_PROVIDER` | `none` | `none` or `espeak`; narration is opt-in per job. |
+| `NARRATION_VOICE` / `NARRATION_SPEED` | `en` / `165` | eSpeak NG voice and words-per-minute setting. This is a generic synthetic voice, not voice cloning. |
+| `ESPEAK_BINARY` / `FFMPEG_BINARY` / `FFPROBE_BINARY` | `espeak-ng` / `ffmpeg` / `ffprobe` | Executable names/paths for local media tools. |
+| `MAX_GENERATION_ATTEMPTS` | `3` | Maximum attempts per job, including the initial render. |
+| `CATEGORY_TEMPLATES` | `{}` | Optional JSON object mapping category names to templates using `{title}` and `{commentary}`. |
 
 Ranking weights must be nonnegative and have a positive sum. The formula and missing-data behavior are described in [docs/api-testing.md](docs/api-testing.md).
 
@@ -104,6 +140,22 @@ Try these routes in Swagger at `http://localhost:8000/docs`:
 - `GET /api/v1/categories` returns configured categories: celebrities, music, rap, documentaries, animation, gaming, education, comedy, sports, and children's content by default.
 
 See [docs/api-testing.md](docs/api-testing.md) for request/response examples and errors for each endpoint.
+
+## Phase 3 video generation
+
+### Rights and source handling
+
+Only upload media you own or have explicit permission/license to reuse. Upload and direct-URL registration require a rights-verification attestation and license/permission details. This is a user attestation, not legal verification. Discovered YouTube candidates default to `REQUIRES_PERMISSION`; submitting a generation job for one will not invoke FFmpeg. Attach authorized media to that candidate first. Direct YouTube/watch/shorts/googlevideo URLs are blocked. Direct HTTPS media URLs must be public, end with a supported video extension, and return video bytes. URL fetching does not follow redirects and rejects private/local IPs.
+
+Captions, cropping, narration, or commentary do not make someone else's footage copyright-safe. No DRM or access restrictions are bypassed. No background music is added. Phase 3 does not upload videos or use OAuth.
+
+### Generate a Short
+
+Start Uvicorn, open the Codespaces forwarded port 8000, and visit `/docs`. Upload a user-owned/licensed file using `POST /api/v1/shorts/sources/upload`, or register a directly downloadable authorized HTTPS asset using `POST /api/v1/shorts/sources/url`. Then submit its `source_id` to `POST /api/v1/shorts/generate`. Generation currently runs synchronously in the API request and returns the persisted job state/result. Use `GET /api/v1/shorts/jobs/{job_id}` to inspect it and `/preview` to download a completed MP4.
+
+The generated MP4 and SRT captions are stored under `data/outputs/` by default; source files are under `data/media/`. Both directories are ignored by Git. Generated titles, descriptions, scripts, captions, rights details, settings, output metadata, and errors are stored in SQLite for review. Templates are deterministic and local. Optional eSpeak NG narration is generic synthesized speech and does not clone real people.
+
+Codespace workspace storage is local to that Codespace. Files generally remain while it is stopped/restarted, but deleting the Codespace can delete its uncommitted media. Download finished videos via the preview endpoint and save them outside the Codespace for durable retention. Do not commit generated videos, source media, or database files.
 
 ### Ranking model
 
@@ -127,6 +179,7 @@ app/
 	config.py          Environment-backed settings
 	database.py        SQLAlchemy setup and additive migration
 	discovery/         Provider, schemas, routes, and ranking service
+	generation/        Rights validation, providers, FFmpeg, job service, and routes
 	errors.py          Consistent API error responses
 	init_db.py         Explicit database initialization command
 	logging_config.py  Structured JSON logging
@@ -137,8 +190,9 @@ docs/
 tests/
 	test_api.py        API and additive migration tests
 	test_discovery.py  Mocked discovery and ranking tests
+	test_generation.py Mocked media generation, permissions, and job lifecycle tests
 ```
 
 ## Scope and next phases
 
-The initial tables remain `SourceVideo`, `GeneratedShort`, `PublishingJob`, and `UploadHistory`. Phase 2 reuses `SourceVideo` for candidates, identified by the existing unique platform video ID. Future FFmpeg generation and authorized YouTube OAuth/upload workflows are intentionally not implemented here.
+The initial tables remain `SourceVideo`, `GeneratedShort`, `PublishingJob`, and `UploadHistory`. Phase 2 reuses `SourceVideo` for discovered candidates; Phase 3 extends it with rights and local-media metadata and uses `GeneratedShort` as a generation-job record. YouTube OAuth, uploading, and automated scheduling are reserved for a future phase.

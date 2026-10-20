@@ -1,0 +1,1 @@
+"""Authorized local video generation pipeline."""
