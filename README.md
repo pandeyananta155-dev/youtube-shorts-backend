@@ -1,14 +1,14 @@
 # YouTube Shorts Automation Backend
 
-Phase 1–3 foundation for a locally runnable YouTube Shorts automation backend. It provides FastAPI, SQLite persistence, YouTube Data API v3 discovery/ranking, and a local authorized-source-to-Short rendering pipeline. Phase 3 creates draft scripts, captions, metadata, and local vertical MP4 files; it does not upload or schedule content.
+Phase 1–4 foundation for a locally runnable YouTube Shorts automation backend. It provides FastAPI, SQLite persistence, YouTube Data API v3 discovery/ranking, authorized local video rendering, owner-authorized OAuth publishing, resumable uploads, and a configurable scheduler. Real uploads are disabled by default and require explicit owner controls.
 
 ## Requirements
 
 - Python 3.12 or newer
 - FFmpeg and ffprobe are required to render/validate videos. Phase 1/2 APIs and tests can run without them. eSpeak NG is optional and only needed for local narration.
 - A YouTube Data API v3 key is optional for startup, health checks, browsing stored candidates, and tests. It is required for live discovery.
-- No OAuth credentials, paid AI services, or external database are required.
-- Runtime packages are listed in `requirements.txt`: FastAPI, Uvicorn, SQLAlchemy, Pydantic Settings, HTTPX, python-multipart, and pytest.
+- No OAuth credentials are needed for tests or local health/discovery/generation work. Google OAuth setup is required for real account publishing.
+- Runtime packages are listed in `requirements.txt`: FastAPI, Uvicorn, SQLAlchemy, Pydantic Settings, HTTPX, python-multipart, Google OAuth/API clients, cryptography, and pytest.
 
 ## Setup
 
@@ -73,7 +73,7 @@ Start the development server on port 8000:
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-The application also initializes/migrates tables on startup. Additive migrations extend the existing `source_videos` and `generated_shorts` tables without removing earlier rows. In Codespaces, open forwarded port 8000. Visit `/health` for service/database status and `/docs` for interactive Swagger documentation. Phase 2/3 endpoints are under `/api/v1`.
+The application initializes/migrates tables on startup. Additive migrations preserve Phase 1–3 rows. In Codespaces, open forwarded port 8000. Visit `/health` for service/database status and `/docs` for interactive Swagger documentation. APIs are under `/api/v1`.
 
 ## Tests
 
@@ -125,6 +125,23 @@ Settings are loaded from environment variables and the optional root `.env` file
 | `ESPEAK_BINARY` / `FFMPEG_BINARY` / `FFPROBE_BINARY` | `espeak-ng` / `ffmpeg` / `ffprobe` | Executable names/paths for local media tools. |
 | `MAX_GENERATION_ATTEMPTS` | `3` | Maximum attempts per job, including the initial render. |
 | `CATEGORY_TEMPLATES` | `{}` | Optional JSON object mapping category names to templates using `{title}` and `{commentary}`. |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` | unset | Google OAuth web client. Needed for channel authorization; keep the secret local. |
+| `GOOGLE_OAUTH_REDIRECT_URI` | localhost callback | Must exactly match a Google Cloud authorized redirect URI. |
+| `OAUTH_TOKEN_ENCRYPTION_KEY` | unset | Fernet key encrypting refresh tokens in SQLite. Back it up securely; losing it requires reconnecting. |
+| `PUBLISHING_ADMIN_TOKEN` | unset | Owner bearer token protecting publishing mutations/settings; minimum 32 characters. |
+| `PUBLISHING_DRY_RUN` | `true` | Default mode records jobs without uploading. |
+| `ENABLE_PUBLIC_PUBLISHING` | `false` | Initial value for the owner-controlled public publishing gate. |
+| `ALLOW_PRIVATE_TEST_UPLOADS` | `false` | Initial value for the explicit private/unlisted test upload gate. |
+| `PUBLISHING_DAILY_TARGET` | `5` | Daily target, restricted to 5–7 Shorts. |
+| `PUBLISHING_TIMEZONE` | `UTC` | IANA timezone for daily limits and windows. |
+| `PUBLISHING_WINDOWS` | `[{"start":"10:00","end":"18:00"}]` | JSON array of local publishing windows. |
+| `PUBLISHING_ALLOWED_DAYS` | `[0,1,2,3,4,5,6]` | JSON weekdays, Monday `0` through Sunday `6`. |
+| `PUBLISHING_SCHEDULER_ENABLED` | `false` | Scheduler starts disabled. |
+| `PUBLISHING_PAUSED_BY_DEFAULT` | `true` | Global publishing starts paused. |
+| `PUBLISHING_REQUIRE_REVIEW` | `true` | Require owner approval before publishing. |
+| `PUBLISHING_SCHEDULER_INTERVAL_SECONDS` | `60` | In-process due-job and status polling interval. |
+| `PUBLISHING_MAX_RETRIES` | `3` | Bounded retries for known transient errors. |
+| `PUBLISHING_UPLOAD_LEAD_MINUTES` | `30` | Start upload this long before YouTube's scheduled `publishAt` time. |
 
 Ranking weights must be nonnegative and have a positive sum. The formula and missing-data behavior are described in [docs/api-testing.md](docs/api-testing.md).
 
@@ -157,6 +174,14 @@ The generated MP4 and SRT captions are stored under `data/outputs/` by default; 
 
 Codespace workspace storage is local to that Codespace. Files generally remain while it is stopped/restarted, but deleting the Codespace can delete its uncommitted media. Download finished videos via the preview endpoint and save them outside the Codespace for durable retention. Do not commit generated videos, source media, or database files.
 
+## Phase 4 OAuth and publishing
+
+See [docs/api-testing.md](docs/api-testing.md) for Google Cloud setup and the full Swagger workflow. Enable YouTube Data API v3, configure an OAuth consent screen and owner test user, create a **Web application** OAuth client, and register the exact local or Codespaces callback URI. Set the client ID/secret in `.env`. Generate `OAUTH_TOKEN_ENCRYPTION_KEY` and `PUBLISHING_ADMIN_TOKEN` locally; never share or commit them. Refresh tokens are Fernet-encrypted in SQLite. Back up the encryption key securely or reconnect the channel after losing it.
+
+OAuth requests only `youtube.upload` and `youtube.readonly`. Publishing starts dry-run, globally paused, with review required and both public and private test uploads disabled. A private test upload requires explicitly enabling private test uploads and reviewing the Short; public publishing additionally requires `dry_run=false` and `public_publishing_enabled=true`. Google may restrict projects that have not completed its required API audit to private uploads; account eligibility and quota remain controlled by Google.
+
+The scheduler assigns 5–7 eligible Shorts per local calendar day within the owner's IANA timezone, weekdays, and windows. It uploads scheduled videos privately with YouTube's `publishAt` field shortly before the configured time; `UPLOADED` is not considered `PUBLISHED` until YouTube confirms public availability. The in-process scheduler runs only while Uvicorn is alive; use one app worker with SQLite. A stopped/suspended Codespace cannot process jobs. For dependable schedules, use an always-on owner-controlled host. Global pause stops new local publishing work; videos already uploaded to YouTube with a future `publishAt` remain scheduled there until cancelled.
+
 ### Ranking model
 
 Each available factor is normalized to 0–100; the final score is the weighted mean of available factors only:
@@ -180,6 +205,7 @@ app/
 	database.py        SQLAlchemy setup and additive migration
 	discovery/         Provider, schemas, routes, and ranking service
 	generation/        Rights validation, providers, FFmpeg, job service, and routes
+	publishing/        OAuth, encrypted credentials, upload service, scheduling, and routes
 	errors.py          Consistent API error responses
 	init_db.py         Explicit database initialization command
 	logging_config.py  Structured JSON logging
@@ -191,8 +217,9 @@ tests/
 	test_api.py        API and additive migration tests
 	test_discovery.py  Mocked discovery and ranking tests
 	test_generation.py Mocked media generation, permissions, and job lifecycle tests
+	test_publishing.py Mocked OAuth, resumable upload, retries, scheduling, and safety tests
 ```
 
-## Scope and next phases
+## Scope
 
-The initial tables remain `SourceVideo`, `GeneratedShort`, `PublishingJob`, and `UploadHistory`. Phase 2 reuses `SourceVideo` for discovered candidates; Phase 3 extends it with rights and local-media metadata and uses `GeneratedShort` as a generation-job record. YouTube OAuth, uploading, and automated scheduling are reserved for a future phase.
+Workflow tables remain `SourceVideo`, `GeneratedShort`, `PublishingJob`, and `UploadHistory`; Phase 4 adds OAuth connection/state and owner publishing settings. No frontend, paid AI/database service, or monetization/reach guarantee is included.

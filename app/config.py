@@ -56,10 +56,31 @@ class Settings(BaseSettings):
     ffprobe_binary: str = "ffprobe"
     max_generation_attempts: int = Field(default=3, ge=1, le=10)
     category_templates: dict[str, str] = Field(default_factory=dict)
+    google_client_id: str | None = None
+    google_client_secret: SecretStr | None = None
+    google_oauth_redirect_uri: str = "http://localhost:8000/api/v1/youtube/auth/callback"
+    oauth_token_encryption_key: SecretStr | None = None
+    publishing_admin_token: SecretStr | None = None
+    publishing_dry_run: bool = True
+    enable_public_publishing: bool = False
+    allow_private_test_uploads: bool = False
+    publishing_daily_target: int = Field(default=5, ge=5, le=7)
+    publishing_timezone: str = "UTC"
+    publishing_windows: list[dict[str, str]] = Field(
+        default_factory=lambda: [{"start": "10:00", "end": "18:00"}]
+    )
+    publishing_allowed_days: list[int] = Field(default_factory=lambda: [0, 1, 2, 3, 4, 5, 6])
+    publishing_scheduler_enabled: bool = False
+    publishing_paused_by_default: bool = True
+    publishing_require_review: bool = True
+    publishing_scheduler_interval_seconds: int = Field(default=60, ge=10, le=3600)
+    publishing_max_retries: int = Field(default=3, ge=1, le=10)
+    publishing_upload_lead_minutes: int = Field(default=30, ge=5, le=1440)
 
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
+        env_ignore_empty=True,
         extra="ignore",
     )
 
@@ -84,6 +105,10 @@ class Settings(BaseSettings):
             raise ValueError("VIDEO_ASPECT_RATIO must contain positive integers") from exc
         if expected_ratio <= 0 or abs((self.video_width / self.video_height) - expected_ratio) > 0.01:
             raise ValueError("Configured video dimensions must match VIDEO_ASPECT_RATIO")
+        if any(day < 0 or day > 6 for day in self.publishing_allowed_days):
+            raise ValueError("PUBLISHING_ALLOWED_DAYS must contain weekday numbers from 0 to 6")
+        if self.publishing_admin_token and len(self.publishing_admin_token.get_secret_value()) < 32:
+            raise ValueError("PUBLISHING_ADMIN_TOKEN must contain at least 32 characters")
         return self
 
     @field_validator("caption_font_name")

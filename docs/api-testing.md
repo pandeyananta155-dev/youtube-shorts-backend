@@ -502,6 +502,214 @@ espeak-ng --version
 
 If narration is requested while the provider is `none` or unavailable, the job fails clearly and preserves its script/captions for review. No paid AI provider or voice cloning is included.
 
+## Phase 4: OAuth and publishing
+
+All publishing mutations, settings, job lists/details, schedules, and history require the owner admin bearer token. OAuth callback is protected by a one-time state value stored as a hash with a 10-minute expiry. `GET /api/v1/youtube/auth/status` is read-only and does not return credentials. OAuth uses only `youtube.upload` and `youtube.readonly`. Refresh tokens are Fernet-encrypted in SQLite; access tokens, refresh tokens, client secrets, and authorization codes are never included in response payloads or application logs.
+
+### Google Cloud and OAuth setup
+
+1. In Google Cloud Console, create/select the project and enable **YouTube Data API v3**.
+2. Configure the OAuth consent screen. For an External app in Testing, add the account owner as a test user. Google may expire testing refresh tokens after a limited period; follow the current Google consent-screen requirements.
+3. Create an OAuth client ID of type **Web application**. Add the exact callback URI as an Authorized redirect URI:
+   - Local: `http://localhost:8000/api/v1/youtube/auth/callback`
+   - Codespaces: `https://<CODESPACE_NAME>-8000.app.github.dev/api/v1/youtube/auth/callback`
+4. Put the Google client ID, secret, and matching redirect URI in the local `.env`. Do not commit `.env`.
+5. Generate two independent secrets locally and store them only in `.env`:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
+
+Use the first value for `OAUTH_TOKEN_ENCRYPTION_KEY` and the second for `PUBLISHING_ADMIN_TOKEN`. The bearer token must be at least 32 characters. Back up the encryption key securely; without it, stored refresh tokens cannot be decrypted and the account must reconnect. Empty entries in `.env.example` are placeholders and are ignored.
+
+Google may require an OAuth verification/API compliance audit before videos can be uploaded publicly. Some unverified API projects are restricted to private uploads. Channel/account restrictions, quota, consent-screen review status, and current Google policy cannot be overridden by this application.
+
+### Authorize or disconnect the channel
+
+In Swagger, authorize admin operations by sending `Authorization: Bearer <PUBLISHING_ADMIN_TOKEN>` on each protected operation. The token is an owner-generated local secret, not a Google token.
+
+`GET /api/v1/youtube/auth/status` returns the safe connection state:
+
+```json
+{"connected": false, "status": "DISCONNECTED", "channel_title": null, "connected_at": null, "last_verified_at": null}
+```
+
+1. Call `GET /api/v1/youtube/auth/start` with the admin bearer token. It returns an `authorization_url`; open it in a browser and approve the YouTube channel access.
+2. Google redirects to the registered callback. On success, the callback returns channel status/title only, never OAuth code or tokens.
+3. Call `GET /api/v1/youtube/auth/status` to verify the connected channel.
+4. Call `POST /api/v1/youtube/auth/disconnect` with the admin bearer token to revoke with Google where possible and always clear the local encrypted token. If a token is expired/revoked, the connection becomes `REAUTH_REQUIRED`; authorize again.
+
+OAuth setup/configuration problems return HTTP 503. Denied consent or invalid/expired/reused state returns HTTP 400. If callback URI mismatch occurs, make the `.env` URI exactly match the Google Cloud URI and restart Uvicorn.
+
+### Publishing settings
+
+`GET /api/v1/publishing/settings` requires admin bearer auth and returns owner controls without secrets:
+
+```json
+{
+  "daily_target": 5,
+  "timezone": "UTC",
+  "publishing_windows": [{"start": "10:00", "end": "18:00"}],
+  "allowed_days": [0, 1, 2, 3, 4, 5, 6],
+  "scheduler_enabled": false,
+  "globally_paused": true,
+  "require_review": true,
+  "dry_run": true,
+  "public_publishing_enabled": false,
+  "allow_private_test_uploads": false,
+  "max_retries": 3,
+  "upload_lead_minutes": 30
+}
+```
+
+Example read:
+
+```bash
+curl http://localhost:8000/api/v1/publishing/settings \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+```
+
+`PUT /api/v1/publishing/settings` replaces these settings. `daily_target` must be 5–7; timezone must be an IANA name; windows use `HH:MM` 24-hour local time and cannot overlap; days are Monday `0` through Sunday `6`. Public publishing cannot be enabled while dry-run remains true.
+
+Example settings update for safe dry-run testing:
+
+```json
+{
+  "daily_target": 5,
+  "timezone": "America/Los_Angeles",
+  "publishing_windows": [{"start": "10:00", "end": "18:00"}],
+  "allowed_days": [0, 1, 2, 3, 4, 5, 6],
+  "scheduler_enabled": false,
+  "globally_paused": false,
+  "require_review": true,
+  "dry_run": true,
+  "public_publishing_enabled": false,
+  "allow_private_test_uploads": false,
+  "max_retries": 3,
+  "upload_lead_minutes": 30
+}
+```
+
+### Dry-run and private test upload
+
+Start with dry-run. It creates a job and records reviewable data but makes no YouTube upload request. The generated Short must be `COMPLETED`, source rights must be `VERIFIED`, and the owner must set `review_confirmed: true`.
+
+`POST /api/v1/publishing/jobs` request:
+
+```json
+{
+  "generated_short_id": 42,
+  "privacy_status": "private",
+  "review_confirmed": true,
+  "idempotency_key": "owner-short-42-review-1",
+  "title": "Owner-reviewed title",
+  "description": "Owner-reviewed description #Shorts"
+}
+```
+
+Same source/Short returns the existing job. The `idempotency_key` is additionally checked to prevent accidental reuse for a different Short. Job response includes status, edited title/description, dry-run flag, attempts, YouTube ID/URL if returned, errors, and timestamps.
+
+Example dry-run response (`201`):
+
+```json
+{
+  "job_id": 13,
+  "generated_short_id": 42,
+  "title": "Owner-reviewed title",
+  "description": "Owner-reviewed description #Shorts",
+  "status": "PENDING",
+  "privacy_status": "private",
+  "dry_run": true,
+  "review_confirmed": true,
+  "scheduled_at": null,
+  "video_id": null,
+  "video_url": null,
+  "attempts": 0,
+  "max_attempts": 3,
+  "last_error": "Dry run: no YouTube upload was attempted",
+  "api_error_code": null,
+  "next_attempt_at": null,
+  "outcome_unknown": false,
+  "created_at": "2026-10-20T12:00:00Z",
+  "updated_at": "2026-10-20T12:00:00Z"
+}
+```
+
+After reviewing a dry-run job, enable a private test upload in settings: set `dry_run=false`, `globally_paused=false`, `allow_private_test_uploads=true`, keep `public_publishing_enabled=false`, and keep `require_review=true`. Then call `POST /api/v1/publishing/jobs/{job_id}/retry` to explicitly promote that pending dry-run job. The endpoint validates the output again with ffprobe, checks rights/review/OAuth, and sends a resumable upload using the private privacy setting. Do not use a public privacy setting until the owner has explicitly enabled public publishing and the Google project/channel are eligible.
+
+### Enable public publishing
+
+Only after the private test succeeds and is reviewed, use `PUT /api/v1/publishing/settings` with `dry_run=false`, `public_publishing_enabled=true`, desired review settings, and the chosen 5–7/day target, timezone, windows, and allowed days. A public job is rejected/held as `NEEDS_REVIEW` if this gate is off. The API does not promise reach or monetization.
+
+### Jobs, retries, history, and errors
+
+- `POST /api/v1/publishing/jobs`: create a job for a completed Short, with owner-edited title/description, privacy, review confirmation, and optional idempotency key.
+- `GET /api/v1/publishing/jobs`: paginated list; filter by `status` and `privacy_status`.
+- `GET /api/v1/publishing/jobs/{job_id}`: retrieve state and last error.
+- `POST /api/v1/publishing/jobs/{job_id}/retry`: retry known eligible failures after backoff; also explicitly promotes a dry-run pending job after dry-run has been disabled. Unknown upload outcomes are reconciled first and never blindly retried.
+- `GET /api/v1/publishing/history`: paginated upload-attempt history with YouTube ID/URL, visibility, error code, and confirmation timestamp.
+
+Use the owner bearer token for each:
+
+```bash
+curl 'http://localhost:8000/api/v1/publishing/jobs?page=1&page_size=20&status=UPLOADED' \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+curl http://localhost:8000/api/v1/publishing/jobs/13 \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+curl -X POST http://localhost:8000/api/v1/publishing/jobs/13/retry \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+curl 'http://localhost:8000/api/v1/publishing/history?page=1&page_size=20' \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+```
+
+The paginated job response is `{ "total": 1, "page": 1, "page_size": 20, "items": [ ...job response... ] }`. History uses the same page envelope, with attempt number, status, video ID/URL, privacy status, upload/confirmation times, API error code, and details per item.
+
+Truthful job states include `PENDING`, `SCHEDULED`, `UPLOADING`, `UPLOADED`, `PUBLISHED`, `FAILED`, `NEEDS_REVIEW`, and `CANCELLED`. `UPLOADED` means YouTube returned a video ID; only `PUBLISHED` means a later YouTube status check confirmed public visibility. Private and unlisted uploads remain `UPLOADED`. Retryable failures use exponential backoff and are bounded by `max_retries`. Quota errors wait until Google's Pacific-time daily reset. Network/5xx interruptions become `NEEDS_REVIEW`; inspect the channel or reconcile status before manual action.
+
+Quota is distinct from the app's per-day schedule limit. YouTube upload operations can consume substantial quota; check the current Google quota table and project console. Common errors: `401` admin bearer missing/invalid; `403` missing rights or owner gate; `409` review/state/ambiguous outcome conflict; `429` backoff or quota exhaustion; `503` missing OAuth/encryption config or expired/revoked credentials; `502`/`504` provider/network failures.
+
+### Scheduling, pause, and cancellation
+
+`POST /api/v1/publishing/schedule` accepts `generated_short_ids` or selects eligible completed Shorts, plus `limit`, `privacy_status`, and `review_confirmed`. It creates idempotent jobs at slots within the configured local windows, weekdays, timezone, and daily target. It never schedules an unverified-rights, incomplete, failed, or unreviewed Short. `GET /api/v1/publishing/schedule` lists upcoming jobs.
+
+Request:
+
+```json
+{
+  "generated_short_ids": [42, 43, 44, 45, 46],
+  "limit": 5,
+  "privacy_status": "private",
+  "review_confirmed": true
+}
+```
+
+Response: `{ "count": 5, "jobs": [ ...publishing job response... ] }`. Use `GET /api/v1/publishing/schedule` to list them. It accepts `limit` (default 50, maximum 200).
+
+```bash
+curl -X POST http://localhost:8000/api/v1/publishing/schedule \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"generated_short_ids":[42,43,44,45,46],"limit":5,"privacy_status":"private","review_confirmed":true}'
+curl 'http://localhost:8000/api/v1/publishing/schedule?limit=50' \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+```
+
+For future YouTube publication, videos are uploaded with `privacyStatus=private` and `publishAt` shortly before their requested time. YouTube requires the video to remain private until the scheduled time and may require an eligible/verified channel. The API reports `SCHEDULED` after the private upload is confirmed; polling changes it to `PUBLISHED` only after YouTube reports public status. This behavior depends on YouTube API/account support.
+
+`DELETE /api/v1/publishing/schedule/{job_id}` cancels a local not-yet-uploaded job; if already scheduled on YouTube, it calls YouTube and only records cancellation after private status is confirmed. `POST /api/v1/publishing/pause` stops new local uploads/scheduler work; `POST /api/v1/publishing/resume` resumes it. Pause does not cancel videos already scheduled on YouTube; cancel those jobs individually.
+
+```bash
+curl -X DELETE http://localhost:8000/api/v1/publishing/schedule/13 \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+curl -X POST http://localhost:8000/api/v1/publishing/pause \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+curl -X POST http://localhost:8000/api/v1/publishing/resume \
+  -H "Authorization: Bearer $PUBLISHING_ADMIN_TOKEN"
+```
+
+The scheduler is a simple in-process loop started with FastAPI and persists jobs in SQLite. It is intentionally single-worker. It runs only while the app process is up: a stopped/suspended Codespace cannot publish. Codespace sleep, deletion, and storage are not a dependable always-on scheduler; use a continuously running owner-controlled host for production reliability. The owner can disable scheduler or pause globally at any time.
+
 ## Ranking calculation and limitations
 
 The default factor weights are recency 0.20, views/day 0.45, engagement 0.25, and view velocity 0.10. Each available factor is normalized to 0–100, then:
@@ -553,6 +761,6 @@ Run the complete suite:
 pytest
 ```
 
-Tests cover Phase 1 health/errors and database migration plus mocked discovery, metadata refresh/deduplication, missing metrics/credentials, provider quota errors, filtering, pagination, ranking, and velocity observation requirements.
+Tests cover Phase 1 health/errors and database migration; Phase 2 mocked discovery, metadata refresh/deduplication, filters, ranking and quota errors; Phase 3 rights/file/output validation, mock rendering, retries and safe paths; and Phase 4 OAuth state/encrypted tokens, admin protection, dry-run/privacy/review gates, resumable upload construction, ambiguous outcomes, quota/backoff, idempotency, timezone scheduling, daily caps, pause/cancel, and publication-state reconciliation. Google calls and video rendering are mocked, so tests require no Google credentials, uploads, source footage, FFmpeg, or eSpeak NG.
 
 Phase 2 reuses `source_videos`, whose unique `platform_video_id` prevents duplicate candidates. Existing Phase 1 rows are preserved. `metric_history` stores a bounded set of timestamped observed view counts for velocity evaluation. No footage is downloaded or copied by any endpoint.

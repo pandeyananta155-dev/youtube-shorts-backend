@@ -22,6 +22,9 @@ def test_health_reports_database_status(tmp_path):
         "generated_shorts",
         "publishing_jobs",
         "upload_history",
+        "oauth_connections",
+        "oauth_states",
+        "publishing_settings",
     }
 
 
