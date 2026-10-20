@@ -7,7 +7,9 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from app.config import Settings, get_settings
-from app.database import Base, create_database_engine, create_session_factory
+from app.database import create_database_engine, create_session_factory, ensure_schema
+from app.discovery.provider import DiscoveryProvider, YouTubeDataApiProvider
+from app.discovery.routes import router as discovery_router
 from app.errors import register_error_handlers
 from app.logging_config import configure_logging
 from app import models  # noqa: F401 - register model metadata before table creation
@@ -15,14 +17,18 @@ from app import models  # noqa: F401 - register model metadata before table crea
 logger = logging.getLogger(__name__)
 
 
-def create_app(settings: Settings | None = None, engine: Engine | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    engine: Engine | None = None,
+    discovery_provider: DiscoveryProvider | None = None,
+) -> FastAPI:
     app_settings = settings or get_settings()
     configure_logging(app_settings.log_level)
     app_engine = engine or create_database_engine(app_settings.database_url)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> Any:
-        Base.metadata.create_all(bind=app_engine)
+        ensure_schema(app_engine)
         logger.info("Application started", extra={"environment": app_settings.environment})
         yield
         app_engine.dispose()
@@ -30,12 +36,23 @@ def create_app(settings: Settings | None = None, engine: Engine | None = None) -
     app = FastAPI(
         title=app_settings.app_name,
         version="0.1.0",
-        description="Phase 1 local foundation for YouTube Shorts automation.",
+        description="Phase 1 and 2 local foundation for YouTube Shorts discovery and ranking.",
         lifespan=lifespan,
     )
     app.state.engine = app_engine
     app.state.session_factory = create_session_factory(app_engine)
+    app.state.settings = app_settings
+    api_key = (
+        app_settings.youtube_api_key.get_secret_value()
+        if app_settings.youtube_api_key
+        else None
+    )
+    app.state.discovery_provider = discovery_provider or YouTubeDataApiProvider(
+        api_key,
+        timeout_seconds=app_settings.youtube_request_timeout_seconds,
+    )
     register_error_handlers(app)
+    app.include_router(discovery_router)
 
     @app.get("/health", tags=["health"], summary="Check service and database health")
     def health() -> dict[str, str]:
